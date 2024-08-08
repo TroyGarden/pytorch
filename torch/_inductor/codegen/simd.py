@@ -1405,10 +1405,7 @@ class SIMDScheduling(BaseScheduling):
         _, call_args, _, arg_types = (
             final_kernel.args.python_argdefs()
             if not isinstance(final_kernel, MultiKernel)
-            else None,
-            [],
-            None,
-            None,
+            else [None, [], None, None]
         )
         call_args: List[str]
         arg_types: Optional[List[type]]

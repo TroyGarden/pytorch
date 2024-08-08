@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 from __future__ import annotations
 
+import functools
 import os
 from typing import List, Optional
 
@@ -10,6 +11,8 @@ from .common import TensorArg
 
 
 class DebugPrinterManager:
+    DEBUG_FILTER_DEFAULT_PRINT_ALL = "default"
+
     def __init__(
         self,
         enable_debug_printer: bool,
@@ -24,10 +27,13 @@ class DebugPrinterManager:
         self.kernel_name = kernel_name
         self.arg_types: Optional[List[type]] = None
         self.kernel = kernel
+        self.filtered_kernel_names_to_print = self.get_debug_filtered_kernel_names()
+
+        if enable_debug_printer:
+            V.graph.all_codegen_kernel_names.add(kernel_name)
 
     def __enter__(self):
         if self.enable_debug_printer:
-            V.graph.all_codegen_kernel_names.add(self.kernel_name)
             self.codegen_intermediate_tensor_value_printer(
                 self.args_to_print,
                 self.kernel_name,
@@ -44,12 +50,13 @@ class DebugPrinterManager:
                 arg_types=self.arg_types,
             )
 
+    @functools.lru_cache(None)
     def get_debug_filtered_kernel_names(self) -> List[str]:
         return [
             x.strip()
             for x in os.environ.get(
                 "AOT_INDUCTOR_FILTERED_KERNELS_TO_PRINT",
-                ",".join(V.graph.all_codegen_kernel_names),
+                self.DEBUG_FILTER_DEFAULT_PRINT_ALL,
             )
             .lower()
             .split(",")
@@ -62,19 +69,14 @@ class DebugPrinterManager:
         before_launch=True,
         arg_types: Optional[List[type]] = None,
     ) -> None:
-        # when invoking this codegen_intermediate_tensor_value_printer function,
-        # we already assured that the AOT_INDUCTOR_DEBUG_INTERMEDIATE_VALUE_PRINTER env var is set to 1,
-        # so we can directly use get method for filtered kernel info here
-        filtered_kernel_names_to_print = []
-        if V.graph.cpp_wrapper:
-            filtered_kernel_names_to_print = self.get_debug_filtered_kernel_names()
-
         for i, arg in enumerate(args_to_print):
             if arg_types is not None and not isinstance(arg_types[i], TensorArg):
                 continue
             if (
-                len(filtered_kernel_names_to_print) > 0
-                and kernel_name not in filtered_kernel_names_to_print
+                len(self.filtered_kernel_names_to_print) > 0
+                and self.filtered_kernel_names_to_print[0]
+                != self.DEBUG_FILTER_DEFAULT_PRINT_ALL
+                and kernel_name not in self.filtered_kernel_names_to_print
             ):
                 continue
             launch_prefix = "before_launch" if before_launch else "after_launch"
@@ -87,5 +89,5 @@ class DebugPrinterManager:
                     # TODO: add non-abi compatible mode debug printing info
                     pass
             else:
-                line = f"print('{launch_prefix} {kernel_name} - {arg}', {arg})"
+                line = f"print('{launch_prefix} - {kernel_name} - {arg}', {arg})"
                 self.wrapper.writeline(line)
