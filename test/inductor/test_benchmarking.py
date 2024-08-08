@@ -4,7 +4,7 @@ import unittest
 
 import torch
 from torch._dynamo.utils import counters
-from torch._inductor.runtime.benchmarking import Benchmarker
+from torch._inductor.runtime.benchmarking import Benchmarker, TritonBenchmarker
 from torch._inductor.test_case import run_tests, TestCase
 from torch.testing._internal.common_utils import parametrize
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_CPU, HAS_GPU
@@ -60,6 +60,32 @@ class TestBenchmarker(TestCase):
         self.assertExpectedRaises(
             NotImplementedError, lambda: benchmarker.benchmark_gpu(_callable)
         )
+        self.assertEqual(self.counter_value("benchmark_gpu"), 1)
+
+
+class TestTritonBenchmarker(TestBenchmarker):
+    @property
+    def benchmarker(self):
+        return TritonBenchmarker()
+
+    @unittest.skipIf(not HAS_CPU or not HAS_GPU, "requires CPU and GPU")
+    @parametrize("device", (GPU_TYPE, "cpu"))
+    def test_benchmark(self, device):
+        benchmarker = self.benchmarker
+        fn, args, kwargs, _ = self.make_sum(device)
+        _ = benchmarker.benchmark(fn, *args, **kwargs)
+        self.assertEqual(self.counter_value("benchmark"), 1)
+        if device == "cpu":
+            self.assertEqual(self.counter_value("benchmark_cpu"), 1)
+        else:
+            self.assertEqual(self.counter_value("benchmark_gpu"), 1)
+
+    @unittest.skipIf(not HAS_GPU, "requires GPU")
+    def test_benchmark_gpu(self, device=GPU_TYPE):
+        benchmarker = self.benchmarker
+        _, _callable = self.make_sum(device)
+        _ = benchmarker.benchmark_gpu(_callable)
+        self.assertEqual(self.counter_value("triton_do_bench"), 1)
         self.assertEqual(self.counter_value("benchmark_gpu"), 1)
 
 
