@@ -204,6 +204,15 @@ class SuperVariable(VariableTracker):
                 self.objvar, attr, variables.DeletedVariable()
             )
             return variables.ConstantVariable(None)
+        elif self.objvar.source and inner_fn is object.__new__:
+            return tx.output.side_effects.track_object_new(
+                self.objvar.source,
+                self.objvar.value,
+                variables.UnspecializedNNModuleVariable
+                if issubclass(self.objvar.value, torch.nn.Module)
+                else UserDefinedObjectVariable,
+                {},
+            )
 
         unimplemented(f"non-function or method super: {inner_fn}")
 
