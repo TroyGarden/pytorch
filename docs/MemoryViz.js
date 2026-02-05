@@ -213,10 +213,17 @@ function MemoryView(outer, stack_info, snapshot, device) {
   });
   svg.call(seg_zoom);
 
+  const enabled_streams = snapshot.enabled_streams || new Set();
+  const should_filter = enabled_streams.size > 0;
+
   const sorted_segments = [];
   const block_map = {};
   for (const seg of snapshot.segments) {
     if (seg.device !== device) {
+      continue;
+    }
+    // Filter by enabled streams if stream toggles are active
+    if (should_filter && !enabled_streams.has(seg.stream)) {
       continue;
     }
     sorted_segments.push(
@@ -640,7 +647,17 @@ function create_segment_view(dst, snapshot, device) {
       'display: grid; grid-template-columns: 1fr 2fr; grid-template-rows: 2fr 1fr; height: 100%; gap: 10px',
     );
 
-  const events = snapshot.device_traces[device];
+  const enabled_streams = snapshot.enabled_streams || new Set();
+  const should_filter = enabled_streams.size > 0;
+
+  // Filter events by enabled streams
+  let events = snapshot.device_traces[device];
+  if (should_filter) {
+    events = events.filter(e => e.stream === null || enabled_streams.has(e.stream));
+    // Re-index the filtered events
+    events = events.map((e, idx) => ({...e, idx}));
+  }
+
   const stack_info = StackInfo(outer);
   const memory_view = MemoryView(outer, stack_info, snapshot, device);
   const event_selector = EventSelector(outer, events, stack_info, memory_view);
@@ -710,6 +727,8 @@ function annotate_snapshot(snapshot) {
     }
   }
   snapshot.device_traces = new_traces;
+  // Store unique streams for filtering UI
+  snapshot.unique_streams = Object.values(stream_names).sort((a, b) => a - b);
   // if every event was on the default stream, we elide stream printing
   if (next_stream == 1) {
     for (const device_trace of snapshot.device_traces) {
@@ -717,6 +736,7 @@ function annotate_snapshot(snapshot) {
         t.stream = null;
       }
     }
+    snapshot.unique_streams = [];
   }
 
   for (const seg of snapshot.segments) {
@@ -877,11 +897,25 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
   const actions = [];
   const addr_to_alloc = {};
 
+  const enabled_streams = snapshot.enabled_streams || new Set();
+  const should_filter = enabled_streams.size > 0;
+
+  // Count total elements (unfiltered) for display
+  let total_elements = 0;
+
   const alloc = plot_segments ? 'segment_alloc' : 'alloc';
   const [free, free_completed] = plot_segments
     ? ['segment_free', 'segment_free']
     : ['free', 'free_completed'];
   for (const e of snapshot.device_traces[device]) {
+    // Count all alloc events for total
+    if (e.action === alloc) {
+      total_elements++;
+    }
+    // Filter by enabled streams if stream toggles are active
+    if (should_filter && e.stream !== null && !enabled_streams.has(e.stream)) {
+      continue;
+    }
     switch (e.action) {
       case alloc:
         elements.push(e);
@@ -908,6 +942,14 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
       continue;
     }
     if (plot_segments) {
+      // Count for total
+      if (!(seg.address in addr_to_alloc)) {
+        total_elements++;
+      }
+      // Filter by enabled streams if stream toggles are active
+      if (should_filter && !enabled_streams.has(seg.stream)) {
+        continue;
+      }
       if (!(seg.address in addr_to_alloc)) {
         const element = {
           action: 'alloc',
@@ -921,6 +963,16 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
         initially_allocated.push(elements.length - 1);
       }
     } else {
+      for (const b of seg.blocks) {
+        // Count for total
+        if (b.state === 'active_allocated' && !(b.addr in addr_to_alloc)) {
+          total_elements++;
+        }
+      }
+      // Filter by enabled streams if stream toggles are active
+      if (should_filter && !enabled_streams.has(seg.stream)) {
+        continue;
+      }
       for (const b of seg.blocks) {
         if (b.state === 'active_allocated' && !(b.addr in addr_to_alloc)) {
           const element = {
@@ -1069,6 +1121,7 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
     max_at_time,
     summarized_mem,
     elements_length: elements.length,
+    total_elements_length: should_filter ? total_elements : elements.length,
     context_for_id: id => {
       const elem = elements[id];
       let text = `Addr: ${formatAddr(elem)}`;
@@ -1339,7 +1392,7 @@ function create_trace_view(
       create_trace_view(dst, snapshot, device, plot_segments, this.value);
     });
   d.append('label').text(
-    `Detail: ${max_entries} of ${data.elements_length} entries`,
+    `Detail: ${max_entries} of ${data.total_elements_length}`,
   );
 
   const grid_container = dst
@@ -1728,6 +1781,12 @@ for (const x in kinds) {
   view.append('option').text(x);
 }
 const gpu = body.append('select');
+const stream_toggles_container = body.append('span').attr('style', 'margin-left: 10px;');
+stream_toggles_container.append('span').text('Streams: ').attr('style', 'font-weight: bold;');
+const stream_toggles = stream_toggles_container.append('span');
+
+// Track which streams are enabled (all enabled by default)
+let enabled_streams = new Set();
 
 function unpickle_and_annotate(data) {
   data = unpickle(data);
@@ -1771,7 +1830,51 @@ function snapshot_change(f) {
     gpu.node().value = device;
   }
 
-  const key = [f, view_value, device];
+  // Update stream toggles
+  stream_toggles.selectAll('label').remove();
+  const unique_streams = snapshot.unique_streams || [];
+  if (unique_streams.length > 0) {
+    stream_toggles_container.attr('style', 'margin-left: 10px;');
+    // Only reset enabled_streams if this is a different snapshot (streams don't match)
+    const unique_streams_set = new Set(unique_streams);
+    const is_different_snapshot = enabled_streams.size === 0 ||
+      [...enabled_streams].some(s => !unique_streams_set.has(s));
+    if (is_different_snapshot) {
+      enabled_streams = new Set(unique_streams);
+    }
+    for (const stream_id of unique_streams) {
+      const label = stream_toggles.append('label')
+        .attr('style', 'margin-left: 5px; cursor: pointer;');
+      label.append('input')
+        .attr('type', 'checkbox')
+        .property('checked', enabled_streams.has(stream_id))
+        .on('change', function() {
+          if (this.checked) {
+            enabled_streams.add(stream_id);
+          } else {
+            enabled_streams.delete(stream_id);
+          }
+          // Clear cached views to force re-render with new stream filter
+          for (const k of Object.keys(selection_to_div)) {
+            if (k !== '') {
+              selection_to_div[k].remove();
+              delete selection_to_div[k];
+            }
+          }
+          selected_change();
+        });
+      label.append('span').text(` ${stream_id}`);
+    }
+  } else {
+    stream_toggles_container.attr('style', 'display: none;');
+  }
+
+  // Always update snapshot.enabled_streams before creating views
+  snapshot.enabled_streams = enabled_streams;
+
+  // Include enabled_streams in cache key
+  const streams_key = [...enabled_streams].sort((a, b) => a - b).join(',');
+  const key = `${f}|${view_value}|${device}|${streams_key}`;
   if (!(key in selection_to_div)) {
     selection_to_div[key] = d3.select('body').append('div');
     kinds[view_value](selection_to_div[key], snapshot, device);
