@@ -650,12 +650,10 @@ function create_segment_view(dst, snapshot, device) {
   const enabled_streams = snapshot.enabled_streams || new Set();
   const should_filter = enabled_streams.size > 0;
 
-  // Filter events by enabled streams
+  // Filter events by enabled streams (preserving original idx for x coordinate)
   let events = snapshot.device_traces[device];
   if (should_filter) {
     events = events.filter(e => e.stream === null || enabled_streams.has(e.stream));
-    // Re-index the filtered events
-    events = events.map((e, idx) => ({...e, idx}));
   }
 
   const stack_info = StackInfo(outer);
@@ -907,11 +905,24 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
   const [free, free_completed] = plot_segments
     ? ['segment_free', 'segment_free']
     : ['free', 'free_completed'];
+
+  // First pass: find the minimum actual timestamp from events with valid time_us
+  let min_actual_time = Infinity;
+  for (const e of snapshot.device_traces[device]) {
+    if (e.time_us !== undefined && e.time_us !== null && e.time_us > 0) {
+      min_actual_time = Math.min(min_actual_time, e.time_us);
+    }
+  }
+  // Default timestamp for events without time_us: slightly before the minimum actual timestamp
+  const default_time = min_actual_time === Infinity ? 0 : min_actual_time - 1;
+
   for (const e of snapshot.device_traces[device]) {
     // Count all alloc events for total
     if (e.action === alloc) {
       total_elements++;
     }
+    // Use event time_us as x coordinate (fall back to slightly before min timestamp)
+    const event_time = (e.time_us !== undefined && e.time_us !== null && e.time_us > 0) ? e.time_us : default_time;
     // Filter by enabled streams if stream toggles are active
     if (should_filter && e.stream !== null && !enabled_streams.has(e.stream)) {
       continue;
@@ -920,17 +931,17 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
       case alloc:
         elements.push(e);
         addr_to_alloc[e.addr] = elements.length - 1;
-        actions.push(elements.length - 1);
+        actions.push({elem: elements.length - 1, time: event_time});
         break;
       case free:
       case free_completed:
         if (e.addr in addr_to_alloc) {
-          actions.push(addr_to_alloc[e.addr]);
+          actions.push({elem: addr_to_alloc[e.addr], time: event_time});
           delete addr_to_alloc[e.addr];
         } else {
           elements.push(e);
           initially_allocated.push(elements.length - 1);
-          actions.push(elements.length - 1);
+          actions.push({elem: elements.length - 1, time: event_time});
         }
         break;
       default:
@@ -994,7 +1005,7 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
   // but if there are existing allocations we do not want to hide them
   // by having just one allocate action it will show a flat graph with all segments
   if (actions.length === 0 && initially_allocated.length > 0) {
-    actions.push(initially_allocated.pop());
+    actions.push({elem: initially_allocated.pop(), time: default_time});
   }
 
   const current = [];
@@ -1004,7 +1015,11 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
 
   let total_mem = 0;
   let total_summarized_mem = 0;
-  let timestep = 0;
+  let timestep = default_time;
+
+  // Track actual time range for proper x-axis scaling
+  let min_time = Infinity;
+  let max_time = -Infinity;
 
   const max_at_time = [];
 
@@ -1066,16 +1081,27 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
     }
   }
 
-  for (const elem of actions) {
+  for (const action of actions) {
+    const elem = action.elem;
+    const event_time = action.time;
     const size = elements[elem].size;
+
+    // Track time range
+    min_time = Math.min(min_time, event_time);
+    max_time = Math.max(max_time, event_time);
+
     if (!(elem in draw_elem)) {
       if (elem in summarized_elems) {
+        // Use event time as x coordinate
+        timestep = event_time;
         advance(1);
         total_summarized_mem -= size;
         summarized_elems[elem] = null;
       } else {
         total_summarized_mem += size;
         summarized_elems[elem] = true;
+        // Use event time as x coordinate
+        timestep = event_time;
         advance(1);
       }
       continue;
@@ -1084,9 +1110,13 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
     // first time we see an action we add it
     // second time we remove it
     if (idx === -1) {
+      // Use event time as x coordinate
+      timestep = event_time;
       add_allocation(elem);
       advance(1);
     } else {
+      // Use event time as x coordinate
+      timestep = event_time;
       advance(1);
       const removed = current_data[idx];
       removed.timesteps.push(timestep);
@@ -1115,6 +1145,12 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
   }
   data.push(summarized_mem);
 
+  // Handle case where no events were processed
+  if (min_time === Infinity) {
+    min_time = 0;
+    max_time = 1;
+  }
+
   return {
     max_size,
     allocations_over_time: data,
@@ -1122,6 +1158,8 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
     summarized_mem,
     elements_length: elements.length,
     total_elements_length: should_filter ? total_elements : elements.length,
+    min_time,
+    max_time,
     context_for_id: id => {
       const elem = elements[id];
       let text = `Addr: ${formatAddr(elem)}`;
@@ -1134,9 +1172,19 @@ function process_alloc_data(snapshot, device, plot_segments, max_entries) {
       if (elem.stream !== null) {
         text = `${text}, stream ${elem.stream}`;
       }
-      if (elem.timestamp !== null) {
-        var d = new Date(elem.time_us / 1000);
-        text = `${text}, timestamp ${d}`;
+      if (elem.time_us !== undefined && elem.time_us !== null) {
+        const time_ms = Math.floor(elem.time_us / 1000);
+        const d = new Date(time_ms);
+        const year = d.getFullYear();
+        const month = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        const hours = String(d.getHours()).padStart(2, '0');
+        const minutes = String(d.getMinutes()).padStart(2, '0');
+        const seconds = String(d.getSeconds()).padStart(2, '0');
+        // Get microseconds: the remainder after converting to seconds
+        const microseconds = String(Math.floor(elem.time_us % 1000000)).padStart(6, '0');
+        const formatted = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}.${microseconds}`;
+        text = `${text}, timestamp ${formatted}`;
       }
       if (!elem.action.includes('alloc')) {
         text = `${text}\nalloc not recorded, stack trace for free:`;
@@ -1172,7 +1220,8 @@ function MemoryPlot(
     return `${p0.join(' ')} ${p1.join(' ')}`;
   }
 
-  const max_timestep = data.max_at_time.length;
+  const max_timestep = data.max_time;
+  const min_timestep = data.min_time;
   const max_size = data.max_size;
 
   const plot_width = width - left_pad;
@@ -1180,7 +1229,7 @@ function MemoryPlot(
 
   const yscale = scaleLinear().domain([0, max_size]).range([plot_height, 0]);
   const yaxis = axisLeft(yscale).tickFormat(d3.format('.3s'));
-  const xscale = scaleLinear().domain([0, max_timestep]).range([0, plot_width]);
+  const xscale = scaleLinear().domain([min_timestep, max_timestep]).range([0, plot_width]);
   const plot_coordinate_space = svg
     .append('g')
     .attr('transform', `translate(${left_pad}, ${0})`);
@@ -1288,27 +1337,58 @@ function ContextViewer(text, data) {
 }
 
 function MiniMap(mini_svg, plot, data, left_pad, width, height = 70) {
-  const max_at_time = data.max_at_time;
   const plot_width = width - left_pad;
   const yscale = scaleLinear().domain([0, data.max_size]).range([height, 0]);
   const minixscale = scaleLinear()
-    .domain([0, max_at_time.length])
+    .domain([data.min_time, data.max_time])
     .range([left_pad, width]);
 
-  const mini_points = [
-    [max_at_time.length, 0],
-    [0, 0],
-  ];
-
-  for (const [i, m] of max_at_time.entries()) {
-    const [_lastx, lasty] = mini_points[mini_points.length - 1];
-    if (m !== lasty) {
-      mini_points.push([i, lasty]);
-      mini_points.push([i, m]);
-    } else if (i === max_at_time.length - 1) {
-      mini_points.push([i, m]);
+  // Build time-value pairs from allocations for the minimap polygon
+  const time_value_pairs = [];
+  for (const alloc of data.allocations_over_time) {
+    if (alloc.timesteps && alloc.offsets) {
+      for (let i = 0; i < alloc.timesteps.length; i++) {
+        const time = alloc.timesteps[i];
+        const offset = alloc.offsets[i];
+        const size = Array.isArray(alloc.size) ? alloc.size[Math.min(i, alloc.size.length - 1)] : alloc.size;
+        time_value_pairs.push([time, offset + size]);
+      }
     }
   }
+
+  // Sort by time and compute max memory at each time point
+  time_value_pairs.sort((a, b) => a[0] - b[0]);
+
+  // Build the polygon points for the minimap
+  const mini_points = [
+    [data.max_time, 0],
+    [data.min_time, 0],
+  ];
+
+  let last_max = 0;
+  let current_time = data.min_time;
+  const time_to_max = new Map();
+
+  // Compute max value at each unique time
+  for (const [time, value] of time_value_pairs) {
+    if (!time_to_max.has(time)) {
+      time_to_max.set(time, value);
+    } else {
+      time_to_max.set(time, Math.max(time_to_max.get(time), value));
+    }
+  }
+
+  // Convert to sorted array
+  const sorted_times = Array.from(time_to_max.entries()).sort((a, b) => a[0] - b[0]);
+
+  for (const [time, max_val] of sorted_times) {
+    if (max_val !== last_max) {
+      mini_points.push([time, last_max]);
+      mini_points.push([time, max_val]);
+      last_max = max_val;
+    }
+  }
+  mini_points.push([data.max_time, last_max]);
 
   let points = mini_points.map(([t, o]) => `${minixscale(t)}, ${yscale(o)}`);
   points = points.join(' ');
@@ -1318,7 +1398,7 @@ function MiniMap(mini_svg, plot, data, left_pad, width, height = 70) {
     .attr('fill', schemeTableau10[0]);
 
   const xscale = scaleLinear()
-    .domain([0, max_at_time.length])
+    .domain([data.min_time, data.max_time])
     .range([0, plot_width]);
 
   const brush = brushX();
@@ -1329,13 +1409,18 @@ function MiniMap(mini_svg, plot, data, left_pad, width, height = 70) {
   brush.on('brush', function (event) {
     const [begin, end] = event.selection.map(x => x - left_pad);
 
-    const stepbegin = Math.floor(xscale.invert(begin));
-    const stepend = Math.floor(xscale.invert(end));
+    const timebegin = xscale.invert(begin);
+    const timeend = xscale.invert(end);
+
+    // Find max value in the selected time range
     let max = 0;
-    for (let i = stepbegin; i < stepend; i++) {
-      max = Math.max(max, max_at_time[i]);
+    for (const [time, value] of sorted_times) {
+      if (time >= timebegin && time <= timeend) {
+        max = Math.max(max, value);
+      }
     }
-    plot.select_window(stepbegin, stepend, max);
+    if (max === 0) max = data.max_size;
+    plot.select_window(timebegin, timeend, max);
   });
   mini_svg.call(brush);
   return {};
